@@ -1,18 +1,10 @@
-# Quarto Analysis Template
+# Analysis Template
 
 A standardized template for data analysis projects using Quarto documents in RStudio.
 
 ## Overview
 
-This repository serves as a template for data analysis projects using Quarto (.qmd) files in RStudio. It provides a consistent structure for your analysis workflows, making it easier to organize your code, data, and outputs.
-
-## Features
-
-- Pre-configured Quarto document with common sections
-- Organized folder structure for data, scripts, and outputs
-- Standard YAML header with useful rendering options
-- Pre-loaded code chunks for common data analysis tasks
-- Consistent styling and formatting
+This repository serves as a template for data analysis projects using Quarto (.qmd) files in RStudio. It provides a consistent structure for your analysis workflows, making it easier to organize your code, data, and outputs while ensuring reproducibility.
 
 ## Getting Started
 
@@ -23,6 +15,7 @@ This repository serves as a template for data analysis projects using Quarto (.q
 3. Name your repository and click "Create repository from template"
 4. Clone the new repository to your local machine
 5. Open the project in RStudio by clicking on the .Rproj file
+6. Begin your analysis by modifying the template.qmd file in the root directory
 
 ### Alternative Method
 
@@ -38,41 +31,16 @@ If you prefer to use RStudio directly:
 ```
 AnalysisTemplate/
 ├── README.md                 # Project documentation
-├── AnalysisTemplate.Rproj  # RStudio project file
-├── template.qmd              # Main Quarto template file
+├── AnalysisTemplate.Rproj    # RStudio project file
 ├── data/                     # Data directory
-│   └── .gitkeep              # Placeholder for git
-├── scripts/                  # R scripts directory
-│   └── helper-functions.R    # Helper functions
-└── outputs/                  # Generated outputs
-    └── .gitkeep              # Placeholder for git
+│   ├── raw/                  # Raw, unprocessed data
+│   └── processed/            # Cleaned and processed data
+├── figures/                  # Output figures and visualizations
+├── models/                   # Saved statistical models
+├── samples/                  # Example files and sample outputs
+├── scripts/                  # Supporting R scripts
+├── functions/                # Custom functions for the project
 ```
-
-## Template Usage
-
-1. Open the `template.qmd` file in RStudio
-2. Modify the YAML header with your project details
-3. Fill in the template sections with your analysis
-4. Use the pre-configured code chunks as starting points
-5. Render the document using the "Render" button in RStudio
-
-## Customization
-
-Feel free to customize this template to fit your specific needs:
-
-- Add or remove sections in the Quarto document
-- Modify the YAML header to change output formats
-- Add additional helper scripts or functions
-- Adjust the folder structure as needed
-
-## Requirements
-
-- RStudio (latest version recommended)
-- Quarto (installed with recent versions of RStudio)
-- R packages:
-  - tidyverse
-  - ggplot2
-  - (add other packages as needed)
 
 ## Contributing
 
