@@ -50,10 +50,10 @@ library(brms)
 library(rstan)
 library(parallel)
 library(bayestestR) # For Bayesian post-processing (Bayes factors, etc.)
-source("/Users/noahrischert/PhD/09_HelperFunctions/pairwise_comparisons.R")
-source("/Users/noahrischert/PhD/09_HelperFunctions/lineplot.ci3.R")
-source("/Users/noahrischert/PhD/09_HelperFunctions/lineplot.ci4.R")
-
+library(smartr)
+source("functions/pairwise_comparisons.R")
+source("functions/lineplot.ci3.R")
+source("functions/lineplot.ci4.R")
 
 
 # (Optional) Set a default ggplot theme
@@ -79,8 +79,6 @@ metadata <- get_JATOS_data(
   dataPath    = "data/raw/",   # or another folder
   attachments = FALSE
 )
-
-head(metadata)
 
 ```
 
@@ -878,4 +876,297 @@ result_rho <- plot_rho_data_with_order(
   output_plots       = TRUE
 )
 
+```
+
+
+## 5.4 BMM
+### 5.4.1 Restructure data for BMM
+
+``` {r}
+
+## ------------------------------------------------------------------ ##
+##  1.  Start from your existing 'contrastCodedData'  (or earlier)    ##
+## ------------------------------------------------------------------ ##
+
+collapsedData <- contrastCodedData %>%           # or dataWithErrorDeg, etc.
+  mutate(
+    ## ---- 1.1  new 6‑level factor -----------------------------------------
+    condition = case_when(
+      presentationType == "Grouped" &
+        setSize          == "3"                     ~ "grouped_setSize3",
+
+      presentationType == "Grouped" &
+        setSize          == "6"                     ~ "grouped_setSize6",
+
+      presentationType == "Separate Unpredictable" &
+        presentationOrder == "A"                    ~ "split_unpredictable_A",
+
+      presentationType == "Separate Unpredictable" &
+        presentationOrder == "B"                    ~ "split_unpredictable_B",
+
+      presentationType == "Separate Predictable" &
+        presentationOrder == "A"                    ~ "split_predictable_A",
+
+      presentationType == "Separate Predictable" &
+        presentationOrder == "B"                    ~ "split_predictable_B",
+
+      TRUE                                           ~ NA_character_   # any row that
+                                                                      # should be dropped
+    ),
+
+    ## ---- 1.2  tidy the two remaining predictors -------------------------
+    condition      = factor(
+                       condition,
+                       levels = c("grouped_setSize3",  "grouped_setSize6",
+                                  "split_unpredictable_A", "split_unpredictable_B",
+                                  "split_predictable_A",  "split_predictable_B")
+                     ),
+    recallPosition = factor(
+                       recallPosition,
+                       levels = c("Tested First", "Tested Second")
+                     ),
+
+    ## ---- 1.3  response in *radians* (needed by bmm) ----------------------
+    response_error = ErrorDegSigned * pi / 180      # keep signed!
+
+  ) %>%
+  ## Drop any row that did not match a real condition -----------------------
+  drop_na(condition)
+
+
+collapsedData <- collapsedData %>% 
+  ## make absolutely sure 'condition' is a factor *after* drop_na()
+  mutate(
+    condition = factor(
+      condition,
+      levels = c("grouped_setSize3",  "grouped_setSize6",
+                 "split_unpredictable_A", "split_unpredictable_B",
+                 "split_predictable_A",  "split_predictable_B")
+    )
+  )
+
+## ------------------------------------------------------------------ ##
+##  2.  Attach equal‑prior contrasts (centred, sum‑to‑zero)           ##
+## ------------------------------------------------------------------ ##
+contrasts(collapsedData$condition)      <- contr.equalprior(n = 6)
+contrasts(collapsedData$recallPosition) <- contr.equalprior(n = 2)
+
+## ------------------------------------------------------------------ ##
+##  3.  Ready for modelling                                           ##
+## ------------------------------------------------------------------ ##
+head(collapsedData %>% 
+       select(participant, condition, recallPosition, response_error) )
+
+trial_counts <- collapsedData %>% 
+  dplyr::count(participant, condition, recallPosition, name = "n_trials")
+```
+
+### 5.4.2 Run analysis
+
+``` {r}
+
+###############################################################################
+# 0) packages -----------------------------------------------------------------
+###############################################################################
+pacman::p_load(bmm, brms, tidyverse, here, tidybayes, patchwork, gghalves)
+
+options(mc.cores = parallel::detectCores())
+
+warmup  <- 3000          # ★ tweak if you like
+post    <- 10000          # ★
+chains  <- 7
+if (chains > parallel::detectCores()) chains <- parallel::detectCores()
+
+mod_onefactor <- mixture2p(resp_error = "response_error")
+
+form_onefactor <- bmf(
+  kappa  ~ 0 + condition * recallPosition +
+            (0 + condition * recallPosition || participant),
+  thetat ~ 0 + condition * recallPosition +
+            (0 + condition * recallPosition || participant)
+)
+
+fit_onefactor <- bmm(
+  formula      = form_onefactor,
+  data         = collapsedData,
+  model        = mod_onefactor,
+  sample_prior = TRUE,
+  save_pars    = save_pars(all = TRUE),
+  warmup       = warmup,
+  iter         = warmup + post,
+  chains       = chains,
+  cores        = parallel::detectCores(),
+  control      = list(adapt_delta   = .99,
+                      max_treedepth = 12),
+  backend      = "cmdstanr",
+  refresh      = 500,
+  file         = here::here("output", "fit_onefactor_bmm")
+)
+
+```
+
+### 5.4.3 Convergence diagnostics
+
+``` {r}
+## ------------------------------------------------------------------ ##
+##  0.  Load the fitted model (if this is a fresh session)            ##
+## ------------------------------------------------------------------ ##
+library(brms)      ; library(bmm)
+library(tidyverse) ; library(tidybayes)
+library(bayesplot) ; library(posterior)
+library(here)      ; library(gghalves)
+theme_set(theme_minimal(base_size = 13))
+
+fit_onefactor <- read_rds(here("output", "fit_onefactor_bmm.rds"))
+#   ^^^ change if you saved it under a different filename / extension
+
+## 1.1  Scalar summaries ------------------------------------------------------
+max_rhat   <- max(rhat(fit_onefactor),         na.rm = TRUE)
+min_neff   <- min(neff_ratio(fit_onefactor),   na.rm = TRUE)
+divergences <- sum(fit_onefactor$fit_diagnostics$divergent__)
+treedepths  <- sum(fit_onefactor$fit_diagnostics$treedepth__ >
+                   fit_onefactor$fit_diagnostics$max_treedepth__)
+
+cat(glue::glue("
+   ── Convergence ─────────────────────────────────────────
+   • max R‑hat        : {round(max_rhat, 3)}
+   • min n_eff / N    : {round(min_neff, 3)}
+   • divergent draws  : {divergences}
+   • saturated trees  : {treedepths}
+"))
+
+## 1.2  Visual checks  --------------------------------------------------------
+bayesplot::mcmc_rhat(rhat(fit_onefactor))              # should all be ≤ 1.01
+bayesplot::mcmc_neff(neff_ratio(fit_onefactor))        # most ≥ 0.1
+bayesplot::mcmc_trace(
+  as_draws_array(fit_onefactor, variable = "^b_"),     # all fixed effects
+  facet_args = list(ncol = 3, strip.position = "left")
+)
+
+# Look for gross mis‑fit in the tails or multimodalities that the mixture cannot capture.
+pp_check(
+  fit_onefactor,
+  group = "condition:recallPosition",
+  type  = "dens_overlay_grouped"
+)
+
+# Extract, back‑transform and tidy the fixed‑effect draws
+draws_tidy <- fit_onefactor %>%
+  tidy_draws() %>%
+  select(starts_with("b_"), .draw) %>%
+  pivot_longer(
+    cols      = starts_with("b_"),
+    names_to  = "term",
+    values_to = "beta"
+  ) %>%
+  separate(
+    term,            # "b_kappa_conditiongrouped_setSize6:recallPosition…"
+    into  = c(".drop","par","cell"), sep = "_", extra = "merge",
+    remove = TRUE
+  ) %>%
+  mutate(
+    par   = recode(par,
+                   kappa  = "SD° (memory imp.)",
+                   thetat = "P(mem)"),
+    value = if_else(par == "SD° (memory imp.)",
+                    (sqrt(1/exp(beta)) / pi) * 180,    # κ → SD in degrees
+                    plogis(beta))                      # θ → probability
+  )
+
+# Quick forest plot
+
+draws_tidy %>%
+  mutate(cell = str_replace_all(cell, "condition", "")) %>%  # cosmetic
+  group_by(par, cell) %>%
+  mean_qi(value, .width = 0.95) %>%
+  ggplot(aes(x = value, y = reorder(cell, value))) +
+  geom_point() +
+  geom_errorbarh(aes(xmin = .lower, xmax = .upper), height = .1) +
+  facet_wrap(~ par, scales = "free_x") +
+  labs(y = NULL, x = "Posterior mean ± 95 % CrI")
+
+```
+### 5.4.4 Specify and test a priori contrasts
+
+```{r}
+# Build a helper table of the 12 cell names
+cell_names <- draws_tidy %>%
+  distinct(cell) %>% arrange(cell) %>% pull()
+cell_names              # print once to check spelling
+
+# Hypotheses of interest:
+## 4.2.1  Predictable vs Unpredictable  (averaged over A/B & recall positions)
+##        – κ and pMem tested separately
+hyp_predictable <- c(
+  # κ (memory precision)
+  "kappa_conditionsplit_predictable_A:recallPositionTestedFirst
+   = kappa_conditionsplit_unpredictable_A:recallPositionTestedFirst",
+
+  "kappa_conditionsplit_predictable_A:recallPositionTestedSecond
+   = kappa_conditionsplit_unpredictable_A:recallPositionTestedSecond",
+
+  "kappa_conditionsplit_predictable_B:recallPositionTestedFirst
+   = kappa_conditionsplit_unpredictable_B:recallPositionTestedFirst",
+
+  "kappa_conditionsplit_predictable_B:recallPositionTestedSecond
+   = kappa_conditionsplit_unpredictable_B:recallPositionTestedSecond",
+
+  # θ → pMem
+  "thetat_conditionsplit_predictable_A:recallPositionTestedFirst
+   = thetat_conditionsplit_unpredictable_A:recallPositionTestedFirst",
+
+  "...and so on for the remaining three cells..."
+)
+
+## 4.2.2  “Split” vs “Grouped 6” (benefit) -------------------------------
+## Null: no difference  →  negative estimate means *benefit*
+benefit_pairs <- expand_grid(
+  split = c("split_predictable_A",  "split_predictable_B",
+            "split_unpredictable_A","split_unpredictable_B"),
+  pos   = c("TestedFirst", "TestedSecond")
+) %>%
+  mutate(
+    hyp_kappa  = glue::glue(
+      "kappa_condition{split}:recallPosition{pos} =
+       kappa_conditiongrouped_setSize6:recallPosition{pos}"
+    ),
+    hyp_theta  = glue::glue(
+      "thetat_condition{split}:recallPosition{pos} =
+       thetat_conditiongrouped_setSize6:recallPosition{pos}"
+    )
+  ) %>%
+  pivot_longer(c(hyp_kappa, hyp_theta), values_to = "hyp") %>%
+  pull(hyp)
+
+## 4.2.3  Combine all into one vector -----------------------------------
+all_hypotheses <- c(hyp_predictable, benefit_pairs)
+
+# Run hypothesis tests
+hyp_res <- hypothesis(fit_onefactor, all_hypotheses)
+print(hyp_res, digits = 3)
+plot(hyp_res)         # forest plot of posterior contrasts
+
+
+```
+### 5.4.5 Plot contrasts
+```{r}
+diff_draws <- draws_tidy %>%
+  unite(cell_full, cell, par, remove = FALSE) %>%      # unique key
+  select(.draw, cell_full, par, value) %>%
+  pivot_wider(names_from = cell_full, values_from = value)
+
+## Example: Split Predictable A – Split Unpredictable A  (Tested First)
+diff_draws <- diff_draws %>%
+  mutate(
+    d_SD  = `conditionSplit_predictable_A:recallPositionTestedFirst_SD° (memory imp.)` -
+            `conditionSplit_unpredictable_A:recallPositionTestedFirst_SD° (memory imp.)`,
+    d_pMem = `conditionSplit_predictable_A:recallPositionTestedFirst_P(mem)` -
+             `conditionSplit_unpredictable_A:recallPositionTestedFirst_P(mem)`
+  )
+
+ggplot(diff_draws, aes(x = d_SD)) +
+  geom_histogram(bins = 80) +
+  geom_vline(xintercept = 0, linetype = 2) +
+  labs(title = "Predictable A – Unpredictable A (Tested First)",
+       x = "Δ SD (deg)", y = "Posterior draws")
 ```
