@@ -1,0 +1,881 @@
+---
+title: "getJatosData"
+author: "Noah Rischert"
+format: html
+editor: source
+editor_options: 
+  chunk_output_type: console
+---
+
+# 1 Initial setting
+
+## 1.1 clear workspace and set default color
+
+```{r reset, include=FALSE}
+# Clear everything
+graphics.off()
+rm(list = ls(all.names = TRUE)) 
+gc()
+
+# Set base R options
+options(digits = 3)
+
+# (Optional) Set some color defaults if desired
+options(
+  ggplot2.discrete.colour = c("#615F63","#FF7F6F","#2F7FC1","#FFBE7A","#8FC0A9","#8A1C56"),
+  ggplot2.discrete.fill   = c("#615F63","#FF7F6F","#2F7FC1","#FFBE7A","#8FC0A9","#8A1C56")
+)
+```
+
+## 1.2 Import functions and packages
+
+```{r}
+
+# If not installed, install the 'smartr' package from the 'develop' branch:
+# devtools::install_github("chenyu-psy/smartr@develop")
+
+# remotes::install_github("paul-buerkner/brms")
+
+# Load your packages
+library(bmm)
+library(ggplot2)
+library(dplyr)
+library(Rmisc)
+library(tidyverse)
+library(smartr)
+library(circular)
+library(purrr)
+library(glue)    
+library(brms)
+library(rstan)
+library(parallel)
+library(bayestestR) # For Bayesian post-processing (Bayes factors, etc.)
+source("/Users/noahrischert/PhD/09_HelperFunctions/pairwise_comparisons.R")
+source("/Users/noahrischert/PhD/09_HelperFunctions/lineplot.ci3.R")
+source("/Users/noahrischert/PhD/09_HelperFunctions/lineplot.ci4.R")
+
+
+
+# (Optional) Set a default ggplot theme
+theme_set(theme_bw())
+dodge2 <- position_dodge(0.2)
+
+```
+
+# 2 Data Preparation
+
+## 2.1 Import data
+
+``` {r}
+# This function downloads data from JATOS and returns metadata about the downloaded files.
+
+# Replace "your_api_token" with your actual JATOS API token,
+# and "123, 124" with the relevant batch IDs in your experiment.
+# The dataPath argument is optional; defaults to a "JATOS_DATA" folder if not specified.
+
+metadata <- get_JATOS_data(
+  token       = "jap_xqlMnZelpmfnJ1GuSATq1ChUuVtHh8g951636", 
+  batchId     = "911",          # one or more batch IDs
+  dataPath    = "data/raw/",   # or another folder
+  attachments = FALSE
+)
+
+head(metadata)
+
+```
+
+## 2.2 Read metadata, filter it
+
+``` {r}
+# If you already have metadata saved from a previous run, you can read it directly:
+# Adjust the file path (here, it's inside "downloaded_data").
+
+metadata <- read_metaData("data/raw/metadata.json")
+
+# Filter out incomplete runs
+completed_data <- metadata %>% 
+  filter(fileSize > 500)
+
+
+```
+
+## 2.3 Read and Combine Data
+
+``` {r}
+# Read the JSON data files associated with your completed runs
+# (NA paths are automatically excluded)
+combinedData <- read_json_data(completed_data$file)
+
+# Check structure or run a simple summary
+summary(combinedData)
+
+# Save study_data as an RDS
+saveRDS(combinedData, "data/raw/experiment2.rds")
+# You can now do further data wrangling, visualization, or modeling with study_data
+```
+
+# 3 Prepare Data
+
+## 3.1 Keep relevant columns that are not practice, and rows from the recall trials (isTestTrial == TRUE)
+
+``` {r}
+declutteredData <- combinedData %>%
+  filter(isTestTrial == TRUE & practice == FALSE) %>%
+  select(
+    rt, participant, subject, blockOrder, trialType,
+    recallOrderinMixed = recallOrder, # Rename "recallOrder" to "recallOrderinMixed", because that is what it really is
+    blockID, segmentID, trialID, practiceTrialID, 
+    numCircles, recallPosition, AorBatRetrieval, side, 
+    stimulusToIdentify, selectedStimuli, click_x, click_y
+  )
+
+# Create setSize with either 3 or 6 for the trials where items were split into two groups of 3, since we do consider those trials to equate to 6 total items.
+declutteredData <- declutteredData %>%
+  mutate(
+    setSize = if_else(
+      trialType == "split" & numCircles == 3,
+      6,            # When condition is TRUE, setSize becomes 6
+      numCircles    # Otherwise, keep the existing number of circles
+    )
+  )
+
+# Replace NA with none so brms can handle it better
+declutteredData <- declutteredData %>%
+  mutate(
+    AorBatRetrieval = if_else(
+      is.na(AorBatRetrieval), 
+      "none", 
+      AorBatRetrieval
+    )
+  )
+
+# Create a new column which combines whether a row (= specific response) was presented grouped, separated, and if it was separated, whether it was predictable or unpredictable
+declutteredData <- declutteredData %>%
+  mutate(
+    presentationType = case_when(
+      trialType == "combined" ~ "grouped",
+      trialType == "split" & recallOrderinMixed == "ABBA"   ~ "separate_predictable",
+      trialType == "split" & recallOrderinMixed == "random" ~ "separate_unpredictable",
+      TRUE ~ NA_character_  # Default/fallback, if none of the above match
+    )
+  )
+
+```
+
+## 3.2 Extrapolate the target and actually selected color values from the lists they are stored within. Calculate the error deviation in degrees.
+
+``` {r}
+# 1) Helpers to handle HSL strings and circular distances
+
+# A simple modulo function
+mod <- function(n, m) {
+  ((n %% m) + m) %% m
+}
+
+# Compute the *small arc* between two angles in [0..360], returning a value in [0..180]
+circDistSmallDeg <- function(a, b) {
+  # This is the absolute difference based on the "wrap-around" of a circle
+  diff_signed <- mod(((b - a) + 180), 360) - 180  # in [-180, 180)
+  abs(diff_signed)
+}
+
+# The *large arc* is simply 360 minus the small arc.
+circDistLargeDeg <- function(a, b) {
+  360 - circDistSmallDeg(a, b)
+}
+
+# Compute the *signed* difference between two angles in [0..360], returning a value in [-180, 180)
+circDistSignedDeg <- function(a, b) {
+  mod(((b - a) + 180), 360) - 180
+}
+
+# Pull out the hue from an HSL string like "hsl(142, 80%, 50%)"
+parse_hue <- function(hsl_string) {
+  as.numeric(sub("hsl\\(([^,]+).*", "\\1", hsl_string))
+}
+
+# 2) Main data‐wrangling steps
+dataWithErrorDeg <- declutteredData %>%
+  dplyr::rowwise() %>%
+  dplyr::mutate(
+    # Grab the fill_color hue from each 1×8 sub-data.frame
+    hue_stimulus = parse_hue(stimulusToIdentify$fill_color),
+    hue_selected = parse_hue(selectedStimuli$fill_color),
+
+    # Compute the small arc distance (absolute error)
+    ErrorDeg = circDistSmallDeg(hue_stimulus, hue_selected),
+
+    # Compute the small arc distance (signed error)
+    ErrorDegSigned = circDistSignedDeg(hue_stimulus, hue_selected),
+
+    # Compute the large arc distance
+    ErrorDegLargeArc = circDistLargeDeg(hue_stimulus, hue_selected)
+  ) %>%
+  dplyr::ungroup() %>%
+  # Optionally remove those list columns if you don’t need them
+  dplyr::select(-stimulusToIdentify, -selectedStimuli)
+
+```
+
+# 4 ABSOLUTE ERRORS
+## 4.1 Get an idea of error sizes for each participant
+
+``` {r}
+
+# 1) Summarize data by participant
+Error_summary <- dataWithErrorDeg %>%
+  dplyr::group_by(participant) %>%
+  dplyr::summarize(
+    meanError = mean(ErrorDeg, na.rm = TRUE),
+    sdError   = sd(ErrorDeg, na.rm = TRUE),
+    medianRT  = median(rt, na.rm = TRUE),
+    n         = dplyr::n()
+  ) %>%
+  dplyr::ungroup()
+
+Error_summary_grouped <- dataWithErrorDeg %>%
+  dplyr::group_by(participant, trialType, numCircles) %>%
+  dplyr::summarize(
+    meanError = mean(ErrorDeg, na.rm = TRUE),
+    sdError   = sd(ErrorDeg, na.rm = TRUE),
+    medianRT  = median(rt, na.rm = TRUE),
+    n         = n()
+  ) %>%
+  ungroup()
+
+
+# 2) Identify participants whose mean ErrorDeg is greater than 85
+bad_participants <- Error_summary %>%
+  dplyr::filter(meanError > 85) %>%
+  dplyr::pull(participant)
+
+# 3) Filter your original dataset to exclude those participants
+dataWithErrorDeg <- dataWithErrorDeg %>%
+  dplyr::filter(!participant %in% bad_participants)
+
+```
+
+## 4.2 Analysis
+
+### 4.2.1 Apply Contrast Coding to the Variables
+
+``` {r}
+# We adopt a contrast coding approach (using contr.equalprior) that aligns with Bayesian
+# principles by encoding factor variables so that their numeric representations are centered 
+# around zero. This reflects our prior belief of no inherent difference between levels—i.e., 
+# an equal prior assumption. The function converts the variable into a factor and attaches a 
+# contrast matrix that specifies unbiased numeric coding. This setup is particularly beneficial 
+# when computing Bayes factors using the Savage–Dickey density ratio.
+
+# First, recode variables as factors with meaningful labels
+
+# This ensures that they are treated as categorical in analyses and that the levels 
+# are clearly identifiable.
+
+contrastCodedData <- dataWithErrorDeg %>%
+  mutate(
+    presentationType   = factor(presentationType, levels = c("grouped", "separate_predictable", "separate_unpredictable"), labels = c("Grouped", "Separate Predictable", "Separate Unpredictable")),
+    recallPosition     = factor(recallPosition, levels = c(1,2), labels = c("Tested First", "Tested Second")),
+    setSize            = factor(setSize, levels = c(3,6), labels = c("3", "6")),
+    presentationOrder  = factor(AorBatRetrieval, levels = c("none", "A", "B"), labels = c("none", "A", "B"))
+  )
+
+# Then, attach bayestestR equal prior contrasts to the factors
+
+# This creates a numeric coding for the factor levels that is centered around zero,
+# reflecting an a priori belief that there is no inherent difference between levels 
+# (i.e., equal prior assumptions).
+
+contrasts(contrastCodedData$presentationType)     <- bayestestR::contr.equalprior(n = 3)
+contrasts(contrastCodedData$recallPosition) <- bayestestR::contr.equalprior(n = 2)
+contrasts(contrastCodedData$setSize)       <- bayestestR::contr.equalprior(n = 2)
+contrasts(contrastCodedData$presentationOrder)   <- bayestestR::contr.equalprior(n = 3)
+
+# Finally, standardize the error degrees
+
+# When using a Cauchy distribution in Bayesian analysis, standardizing the data 
+# ensures that the heavy-tailed nature of the Cauchy is appropriately centered 
+# around zero. This can help the model better capture deviations and handle potential 
+# outliers without being overly influenced by the raw scale of the original measurements.
+
+contrastCodedData <- contrastCodedData %>%
+  mutate(zerror = as.numeric(scale(ErrorDeg)))
+```
+
+### 4.2.2 Data visualization
+
+
+``` {r}
+
+# This type of data visualization is a bit tricky because we have a partial between-subjects factor: "presentationType".
+# The "grouped" level is within‐subjects (everyone saw it), but the two "separate" levels are split between participants.
+# To work around this, we split the data by presentationType (grouped vs. separate) and apply a within‐subject correction
+# only to the conditions each subset actually contains. Then we recombine for plotting.
+#
+# However, keep in mind that the "grouped" condition uses data from all participants, whereas the two "separate"
+# conditions come from distinct subgroups. As a result, the error bars in the final plot reflect different subsets
+# of participants and separate within‐subject corrections. Direct comparisons between "grouped" and "separate"
+# should therefore be interpreted with caution.
+
+
+plot_memory_data_with_order <- function(
+  data,
+  subject_var        = "participant",
+  dv_var             = "ErrorDeg",
+  ws_vars_grouped    = c("recallPosition", "setSize"),
+  ws_vars_separate   = c("recallPosition", "presentationOrder"), 
+  bs_vars_separate   = c("presentationType"), 
+  output_plots       = TRUE
+) {
+  
+  # 1) "grouped" data only
+  data_grouped <- data %>%
+    filter(presentationType == "Grouped")
+  
+  # Summarize for "grouped"
+  grouped_summary <- summarySEwithin(
+    data        = data_grouped,
+    measurevar  = dv_var,
+    idvar       = subject_var,
+    withinvars  = ws_vars_grouped, 
+    betweenvars = NULL,
+    na.rm       = TRUE
+  ) %>%
+    mutate(
+      presentationType  = "Grouped",  # unify columns
+      presentationOrder = "none"      # "Grouped" has no A/B
+    )
+  
+  # 2) "separate" data (predictable + unpredictable)
+  data_separate <- data %>%
+    filter(presentationType %in% c("Separate Predictable", "Separate Unpredictable"))
+  
+  # Summarize for "separate"
+  separate_summary <- summarySEwithin(
+    data        = data_separate,
+    measurevar  = dv_var,
+    idvar       = subject_var,
+    withinvars  = ws_vars_separate,   
+    betweenvars = bs_vars_separate,   
+    na.rm       = TRUE
+  ) %>%
+    mutate(setSize = "6")  # separate data presumably always 6
+  
+  # Combine them
+  combined_summary <- dplyr::bind_rows(grouped_summary, separate_summary) %>%
+    mutate(
+      setSize            = factor(setSize, levels = c("3","6")),
+      presentationType   = factor(
+        presentationType,
+        levels = c("Grouped", "Separate Predictable", "Separate Unpredictable")
+      ),
+      presentationOrder  = factor(
+        presentationOrder,
+        levels = c("none","A","B")
+      )
+    )
+  
+  plot_overlayed <- ggplot(
+    combined_summary,
+aes(
+  x        = recallPosition,
+  y        = ErrorDeg,
+  color    = presentationType,
+  linetype = presentationOrder,
+  group    = interaction(presentationType, presentationOrder)
+)
+  ) +
+    geom_point(
+      aes(shape = presentationOrder),
+      position = position_dodge(width = 0.3),
+      size = 3
+    ) +
+    geom_line(
+      position = position_dodge(width = 0.3)
+    ) +
+    geom_errorbar(
+      aes(
+        ymin = !!sym(dv_var) - se,
+        ymax = !!sym(dv_var) + se
+      ),
+      width = 0.2,
+      position = position_dodge(width = 0.3)
+    ) +
+    facet_wrap(~ setSize
+    ) +
+    labs(
+      title    = "Absolute Deviation in Error Degrees by Presentation Type, Presentation Order, and Recall Position for Set Sizes 3 and 6",
+      x        = "Recall Position",
+      y        = "Error degrees (Cousineau–Morey CI)",
+      color    = "Presentation Type",
+      linetype = "Presentation Order",
+      shape    = "Presentation Order"
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(
+      # Center the title and add extra space below it
+      plot.title = element_text(
+        hjust  = 0.5,
+        margin = margin(b = 20)
+      )
+    )
+  
+  if (output_plots) print(plot_overlayed)
+  
+  # Return list
+  invisible(list(
+    combined_summary = combined_summary,
+    plot_overlayed   = plot_overlayed
+  ))
+}
+
+
+
+result_order <- plot_memory_data_with_order(
+  data               = contrastCodedData,
+  subject_var        = "participant",
+  dv_var             = "ErrorDeg",
+  ws_vars_grouped    = c("recallPosition","setSize"),
+  # If participants in the "separate" subset truly see both A and B within-subject:
+  ws_vars_separate   = c("recallPosition", "presentationOrder"),
+  bs_vars_separate   = c("presentationType"),
+  output_plots       = TRUE
+)
+
+```
+
+### 4.2.3 BRMS settings
+
+``` {r}
+nChains <- 4      # Number of Markov chains
+nCores  <- 4      # Number of cores each model can use
+nIter   <- 10000  # Total MCMC iterations per chain
+nWarmup <- 2000   # Warmup (burn-in) iterations
+
+# Ensures Stan will save compiled models to disk for reuse
+rstan_options(auto_write = TRUE)
+```
+
+### 4.2.4 Specify Priors
+
+``` {r}
+# Do do a prior sensitivity analysis, we run the entire analysis with 3 different 
+# priors. This lets us check whether the Priors we define can influence our conclusions
+
+# Default priors, based on the experiment of Oberauer and Awh we are replicating
+scaleVal_default <- 0.5
+priorExpr_default <- paste0("cauchy(0, ", scaleVal_default, ")")
+fixefPrior_default <- c( set_prior(priorExpr_default, class = "b") )   # fixed effects
+ranefPrior_default <- set_prior("gamma(1,0.05)", class = "sd")          # random effects
+
+# Alternative 1: Less informative fixed-effects prior (wider scale)
+scaleVal_alt1 <- 1.0
+priorExpr_alt1 <- paste0("cauchy(0, ", scaleVal_alt1, ")")
+fixefPrior_alt1 <- c( set_prior(priorExpr_alt1, class = "b") )
+ranefPrior_alt1 <- set_prior("gamma(1,0.05)", class = "sd")  # keeping the same for simplicity
+
+# Alternative 2: More informative priors (narrower fixed effects)
+scaleVal_alt2 <- 0.25
+priorExpr_alt2 <- paste0("cauchy(0, ", scaleVal_alt2, ")")
+fixefPrior_alt2 <- c( set_prior(priorExpr_alt2, class = "b") )
+ranefPrior_alt2 <- set_prior("gamma(1,0.05)", class = "sd")  # keeping the same for simplicity
+
+# Combine all prior sets into a list for sensitivity analysis
+prior_list <- list(
+  default = c(fixefPrior_default, ranefPrior_default),
+  alt1    = c(fixefPrior_alt1, ranefPrior_alt1),
+  alt2    = c(fixefPrior_alt2, ranefPrior_alt2)
+)
+```
+
+## 4.3 Model calculation
+
+``` {r}
+models <- list()
+prior_models <- list()
+
+# First loop: Fit and save the models
+for(prior_label in names(prior_list)) {
+  models[[prior_label]] <- smart_runFun(
+    fun = brm,
+    args = list(
+      formula = zerror ~ setSize * presentationType * recallPosition * presentationOrder +
+        (1 + setSize * presentationType * recallPosition * presentationOrder || participant),
+      data = dataWithErrorDeg,
+      family = gaussian(),
+      prior = prior_list[[prior_label]],
+      chains = nChains,
+      iter = nIter,
+      warmup = nWarmup,
+      cores = nCores,
+      control = list(adapt_delta = 0.95, max_treedepth = 15),
+      save_pars = save_pars(all = TRUE),
+      file = glue::glue("./models/M.Full_{prior_label}")
+    ),
+    name = glue::glue("M.Full_{prior_label}")
+    export = TRUE
+  )
+}
+
+# Optionally, read the saved models if needed
+for(prior_label in names(prior_list)) {
+  models[[prior_label]] <- readRDS(glue::glue("./models/M.Full_{prior_label}.rds"))
+}
+
+# Second loop: Run unupdate on the fitted models to sample from the prior
+for(prior_label in names(prior_list)) {
+  prior_models[[glue::glue("{prior_label}_Priors")]] <- smart_runFun(
+    fun = unupdate,
+    args = list(model = models[[prior_label]]),
+    name = glue::glue("M.Full_{prior_label}_Priors"),
+    export = glue::glue("M.Full_{prior_label}_Priors")
+  )
+  # Save each unupdated model as an RDS in the same folder
+  saveRDS(
+    prior_models[[glue::glue("{prior_label}_Priors")]],
+    file = glue::glue("./models/M.Full_{prior_label}_Priors.rds")
+  )
+}
+
+for(prior_label in names(prior_list)) {
+  prior_models[[glue::glue("{prior_label}_Priors")]] <- readRDS(
+    glue::glue("./models/M.Full_{prior_label}_Priors.rds")
+  )
+}
+
+```
+
+## 4.4 Pairwise contrasts
+
+``` {r}
+# Define all "specs" in a vector
+all_specs <- c(
+  "~presentationType|setSize+recallPosition+presentationOrder",
+  "~setSize|presentationType+recallPosition+presentationOrder",
+  "~recallPosition|presentationType+setSize+presentationOrder",
+  "~presentationOrder|presentationType+setSize+recallPosition"
+)
+
+# Create a container list to hold all results
+pairwise_results <- list()
+
+for (prior_label in names(prior_list)) {
+  
+  message("Submitting pairwise comparisons for: ", prior_label)
+  
+  # Initialize a sub-list in pairwise_results for each prior_label
+  pairwise_results[[prior_label]] <- list()
+  
+  for (spec in all_specs) {
+    
+    # Create a unique job name for each submission
+    job_name <- paste0("pairwise_", prior_label, "_", gsub("[~|+]", "_", spec))
+    
+    # Submit the job using smart_runFun
+    result <- smart_runFun(
+      fun  = pairwise_comparisons,
+      args = list(
+        model       = models[[prior_label]],
+        prior_model = prior_models[[paste0(prior_label, "_Priors")]],
+        specs       = spec,
+        interaction = FALSE
+      ),
+      name   = job_name,
+      export = TRUE
+    )
+    
+    # Store the result for later (so you keep all specs results together)
+    pairwise_results[[prior_label]][[spec]] <- result
+  }
+}
+
+```
+
+``` {r}
+all_specs_main <- c(
+  "~presentationType",
+  "~setSize",
+  "~recallPosition",
+  "~presentationOrder"
+)
+
+pairwise_results_main <- list()
+
+for (prior_label in names(prior_list)) {
+  
+  message("Submitting *main effect* pairwise comparisons for: ", prior_label)
+  
+  # Create a sub-list for each prior
+  pairwise_results_main[[prior_label]] <- list()
+  
+  # Loop over the main-effect specs
+  for (spec in all_specs_main) {
+    
+    # Create a unique job name
+    job_name <- paste0("pairwise_main_", prior_label, "_", gsub("[~+]", "_", spec))
+    
+    # Submit the job using smart_runFun
+    result <- smart_runFun(
+      fun  = pairwise_comparisons,
+      args = list(
+        model       = models[[prior_label]],
+        prior_model = prior_models[[paste0(prior_label, "_Priors")]],
+        specs       = spec,            # <-- Using single-factor specs
+        interaction = FALSE
+      ),
+      name   = job_name,
+      export = TRUE
+    )
+    
+    # Store the result
+    pairwise_results_main[[prior_label]][[spec]] <- result
+  }
+}
+
+```
+
+
+
+# 5 SIGNED ERRORS
+
+## 5.2 Basic visualization:
+
+``` {r}
+dfForPlot <- dataWithErrorDeg %>%
+  mutate(
+    # Ensure the factors have consistent labels
+    presentationType = factor(
+      presentationType,
+      levels = c("grouped", "separate_predictable", "separate_unpredictable"),
+      labels = c("Grouped", "Separate Predictable", "Separate Unpredictable")
+    ),
+    recallPosition = factor(
+      recallPosition,
+      levels = c(1, 2),
+      labels = c("Tested First", "Tested Second")
+    ),
+    setSize = factor(
+      setSize,
+      levels = c(3, 6),
+      labels = c("3", "6")
+    )
+  )
+
+ggplot(
+  dfForPlot,
+  aes(x = ErrorDegSigned)
+) +
+  geom_histogram(
+    binwidth = 15,      # choose a bin width that makes sense for your data
+    color    = "black",
+    fill     = "steelblue",
+    alpha    = 0.7
+  ) +
+  facet_grid(
+    rows    = vars(presentationType, setSize), 
+    cols    = vars(recallPosition)
+  ) +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "Distribution of Signed Errors by Condition (Histogram)",
+    x     = "Signed Error (Degrees)",
+    y     = "Count"
+  )
+
+ggplot(
+  dfForPlot,
+  aes(x = ErrorDegSigned)
+) +
+  geom_density(
+    color = "steelblue",
+    fill  = "steelblue",
+    alpha = 0.3
+  ) +
+  facet_grid(
+    rows = vars(presentationType, setSize),
+    cols = vars(recallPosition)
+  ) +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "Distribution of Signed Errors by Condition (Density)",
+    x     = "Signed Error (Degrees)",
+    y     = "Density"
+  )
+
+```
+
+## 5.3 Elaborate visualization
+
+``` {r}
+# Assume you already have a data frame `contrastCodedData` 
+# with a column `ErrorDegSigned` (the signed errors in degrees).
+# We'll again transform to a circular object, then fit the distribution.
+
+# 1a) Convert to a circular object (still in degrees)
+dataWithErrorDegCircular <- contrastCodedData %>%
+  dplyr::mutate(
+    error_circ = circular(
+      x         = ErrorDegSigned,        # your signed error in degrees
+      units     = "degrees",
+      type      = "angles",
+      template  = "geographics",
+      modulo    = "2pi"                  # effectively uses 360 wrapping for degrees
+    )
+  )
+
+# 1b) For each participant x condition, fit a wrapped Cauchy
+#     and store the results.
+
+dataCauchy <- dataWithErrorDegCircular %>%
+  dplyr::group_by(
+    participant,
+    presentationType,
+    recallPosition,
+    setSize,
+    presentationOrder
+  ) %>%
+  dplyr::summarize(
+    # Fit the wrapped Cauchy distribution to `error_circ`.
+    # If you'd like, you can provide initial guesses for mu and rho. 
+    fit = list(mle.wrappedcauchy(error_circ)),
+
+    # Also keep track of the # of trials per cell
+    n   = n(),
+    .groups = "drop"  # or ungroup() afterwards
+  ) %>%
+  # Extract the parameters: mu (mean direction) and rho (concentration)
+  dplyr::mutate(
+    mu  = map_dbl(fit, ~ as.numeric(.x$mu)),   # in degrees
+    rho = map_dbl(fit, ~ .x$rho)              # in [0..1)
+  )
+
+# Now `dataCauchy` has columns:
+#  - participant, presentationType, recallPosition, setSize, presentationOrder
+#  - fit (list-col), n, mu, rho
+#
+#  rho is analogous to a “concentration” measure: 
+#    * 0.0 means uniform 
+#    * close to 1.0 means highly concentrated
+plot_rho_data_with_order <- function(
+  data, 
+  subject_var        = "participant",
+  dv_var             = "rho",                    # Now "rho" is our measure
+  # For "grouped" data
+  ws_vars_grouped    = c("recallPosition", "setSize"),
+  # For "separate" data
+  ws_vars_separate   = c("recallPosition", "presentationOrder"),
+  bs_vars_separate   = c("presentationType"),
+  output_plots       = TRUE
+) {
+  
+  # 1) Filter data for the "grouped" condition
+  data_grouped <- data %>%
+    dplyr::filter(presentationType == "Grouped")
+  
+  # Summarize for "grouped":
+  grouped_summary <- summarySEwithin(
+    data        = data_grouped,
+    measurevar  = dv_var,                
+    idvar       = subject_var,           
+    withinvars  = ws_vars_grouped,       
+    na.rm       = TRUE
+  ) %>%
+    dplyr::mutate(
+      presentationType  = "Grouped",  
+      presentationOrder = "none"
+    )
+  
+  # 2) Filter data for the “separate” conditions
+  data_separate <- data %>%
+    dplyr::filter(presentationType %in% c("Separate Predictable", "Separate Unpredictable"))
+  
+  # Summarize for "separate":
+  separate_summary <- summarySEwithin(
+    data        = data_separate,
+    measurevar  = dv_var,
+    idvar       = subject_var,
+    withinvars  = ws_vars_separate,       
+    betweenvars = bs_vars_separate,       
+    na.rm       = TRUE
+  ) %>%
+    dplyr::mutate(setSize = "6")  # in separate conditions, setSize is typically 6
+  
+  # 3) Combine
+  combined_summary <- dplyr::bind_rows(grouped_summary, separate_summary) %>%
+    dplyr::mutate(
+      setSize = factor(setSize, levels = c("3","6")),
+      presentationType = factor(
+        presentationType,
+        levels = c("Grouped", "Separate Predictable", "Separate Unpredictable")
+      ),
+      presentationOrder = factor(
+        presentationOrder,
+        levels = c("none","A","B")
+      )
+    )
+  
+  # 4) Plot
+  dv_sym <- rlang::sym(dv_var)
+  
+  plot_overlayed <- ggplot(
+    combined_summary,
+    aes(
+      x        = recallPosition,
+      y        = !!dv_sym,  
+      color    = presentationType,
+      linetype = presentationOrder,
+      group    = interaction(presentationType, presentationOrder)
+    )
+  ) +
+    geom_point(
+      aes(shape = presentationOrder),
+      position = position_dodge(width = 0.3),
+      size     = 3
+    ) +
+    geom_line(position = position_dodge(width = 0.3)) +
+    geom_errorbar(
+      aes(
+        ymin = !!dv_sym - se,
+        ymax = !!dv_sym + se
+      ),
+      width    = 0.2,
+      position = position_dodge(width = 0.3)
+    ) +
+    facet_wrap(~ setSize) +
+    labs(
+      title    = "Wrapped Cauchy Concentration (rho) by Condition",
+      x        = "Recall Position",
+      y        = expression(rho),
+      color    = "Presentation Type",
+      shape    = "Presentation Order",
+      linetype = "Presentation Order"
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(
+      plot.title = element_text(
+        hjust  = 0.5,
+        margin = margin(b = 20)
+      )
+    )
+  
+  if (output_plots) print(plot_overlayed)
+  
+  invisible(list(
+    combined_summary = combined_summary,
+    plot_overlayed   = plot_overlayed
+  ))
+}
+# After you have your dataCauchy with columns:
+#    participant, presentationType, recallPosition, setSize, presentationOrder, rho
+
+result_rho <- plot_rho_data_with_order(
+  data               = dataCauchy,
+  subject_var        = "participant",
+  dv_var             = "rho",
+  ws_vars_grouped    = c("recallPosition","setSize"),
+  ws_vars_separate   = c("recallPosition","presentationOrder"),
+  bs_vars_separate   = c("presentationType"),
+  output_plots       = TRUE
+)
+
+```
