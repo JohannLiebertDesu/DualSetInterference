@@ -51,6 +51,7 @@ library(rstan)
 library(parallel)
 library(bayestestR) # For Bayesian post-processing (Bayes factors, etc.)
 library(smartr)
+library(posterior)
 source("functions/pairwise_comparisons.R")
 source("functions/lineplot.ci3.R")
 source("functions/lineplot.ci4.R")
@@ -964,16 +965,21 @@ trial_counts <- collapsedData %>%
 ### 5.4.2 Run analysis
 
 ``` {r}
+## ---------------------------------------------------------------------
+## 0)  Packages for *this* session  ------------------------------------
+##      (They will also be loaded inside the job – see the wrapper.)
+pacman::p_load(
+  bmm, brms, tidyverse, here, tidybayes, patchwork, gghalves,
+  job         # <- supplies smart_runFun()
+)
 
-###############################################################################
-# 0) packages -----------------------------------------------------------------
-###############################################################################
-pacman::p_load(bmm, brms, tidyverse, here, tidybayes, patchwork, gghalves)
-
+## ---------------------------------------------------------------------
+## 1)  Prepare data & objects that need to be shared with the job ------
+##     (You already have most of this.)
 options(mc.cores = parallel::detectCores())
 
-warmup  <- 3000          # ★ tweak if you like
-post    <- 10000          # ★
+warmup  <- 3000
+post    <- 10000
 chains  <- 7
 if (chains > parallel::detectCores()) chains <- parallel::detectCores()
 
@@ -986,187 +992,587 @@ form_onefactor <- bmf(
             (0 + condition * recallPosition || participant)
 )
 
-fit_onefactor <- bmm(
-  formula      = form_onefactor,
-  data         = collapsedData,
-  model        = mod_onefactor,
-  sample_prior = TRUE,
-  save_pars    = save_pars(all = TRUE),
-  warmup       = warmup,
-  iter         = warmup + post,
-  chains       = chains,
-  cores        = parallel::detectCores(),
-  control      = list(adapt_delta   = .99,
-                      max_treedepth = 12),
-  backend      = "cmdstanr",
-  refresh      = 500,
-  file         = here::here("output", "fit_onefactor_bmm")
+## ---------------------------------------------------------------------
+## 2)  A lightweight wrapper that the Job will actually run ------------
+##     It re‑loads the packages *inside* the parallel R, then calls bmm()
+run_bmm_job <- function(formula, data, model,
+                        warmup, post, chains, outfile) {
+
+  pacman::p_load(bmm, brms, tidyverse, here, tidybayes, patchwork, gghalves)
+
+  if (chains > parallel::detectCores())
+    chains <- parallel::detectCores()
+
+  fit <- bmm(
+    formula      = formula,
+    data         = data,
+    model        = model,
+    sample_prior = TRUE,
+    save_pars    = save_pars(all = TRUE),
+    warmup       = warmup,
+    iter         = warmup + post,
+    chains       = chains,
+    cores        = parallel::detectCores(),   # Stan cores inside the Job
+    control      = list(adapt_delta = .99, max_treedepth = 12),
+    backend      = "cmdstanr",
+    refresh      = 500,
+    file         = outfile
+  )
+
+  readr::write_rds(fit, paste0(outfile, ".rds"))
+  invisible(fit)
+}
+
+## ---------------------------------------------------------------------
+## 3)  Submit the Job  --------------------------------------------------
+job_id <- smart_runFun(
+  fun  = run_bmm_job,
+  args = list(
+    formula = form_onefactor,
+    data    = collapsedData,
+    model   = mod_onefactor,
+    warmup  = warmup,
+    post    = post,
+    chains  = chains,
+    outfile = here::here("output", "fit_onefactor_bmm")
+  ),
+  cores      = chains,                           # what THIS job needs
+  maxCore    = parallel::detectCores(),          # total available
+  priority   = 1,
+  checkInt   = 30,
+  name       = "fit_onefactor_bmm",
+  export     = c("collapsedData")                # ONLY what it needs
 )
 
 ```
 
 ### 5.4.3 Convergence diagnostics
 
+
 ``` {r}
-## ------------------------------------------------------------------ ##
-##  0.  Load the fitted model (if this is a fresh session)            ##
-## ------------------------------------------------------------------ ##
-library(brms)      ; library(bmm)
-library(tidyverse) ; library(tidybayes)
-library(bayesplot) ; library(posterior)
-library(here)      ; library(gghalves)
-theme_set(theme_minimal(base_size = 13))
+## 4.1) fit & summary ----------------------------------------------------------
 
-fit_onefactor <- read_rds(here("output", "fit_onefactor_bmm.rds"))
-#   ^^^ change if you saved it under a different filename / extension
+round(max(rhat(fit_onefactor), na.rm = T),3)
+hist(neff_ratio(fit_onefactor))
+nuts_params(fit_onefactor)
+hist(log_posterior(fit_onefactor)$Value)
 
-## 1.1  Scalar summaries ------------------------------------------------------
-max_rhat   <- max(rhat(fit_onefactor),         na.rm = TRUE)
-min_neff   <- min(neff_ratio(fit_onefactor),   na.rm = TRUE)
-divergences <- sum(fit_onefactor$fit_diagnostics$divergent__)
-treedepths  <- sum(fit_onefactor$fit_diagnostics$treedepth__ >
-                   fit_onefactor$fit_diagnostics$max_treedepth__)
+# plot the posterior predictive check to evaluate overall model fit
+# does the model reproduce the shape of the observed error distribution for each set size?
+brms::pp_check(fit_onefactor, group = "condition", type = "dens_overlay_grouped")
 
-cat(glue::glue("
-   ── Convergence ─────────────────────────────────────────
-   • max R‑hat        : {round(max_rhat, 3)}
-   • min n_eff / N    : {round(min_neff, 3)}
-   • divergent draws  : {divergences}
-   • saturated trees  : {treedepths}
-"))
+# quick plot of the conditional effects on the two parameters
+conditional_effects(fit_onefactor, effects = "condition", dpar = "kappa1")
+conditional_effects(fit_onefactor, effects = "condition", nlpar = "kappa")
 
-## 1.2  Visual checks  --------------------------------------------------------
-bayesplot::mcmc_rhat(rhat(fit_onefactor))              # should all be ≤ 1.01
-bayesplot::mcmc_neff(neff_ratio(fit_onefactor))        # most ≥ 0.1
-bayesplot::mcmc_trace(
-  as_draws_array(fit_onefactor, variable = "^b_"),     # all fixed effects
-  facet_args = list(ncol = 3, strip.position = "left")
-)
+conditional_effects(fit_onefactor, effects = "condition", nlpar = "thetat")
+conditional_effects(fit_onefactor, effects = "condition", dpar = "theta1")
 
-# Look for gross mis‑fit in the tails or multimodalities that the mixture cannot capture.
-pp_check(
-  fit_onefactor,
-  group = "condition:recallPosition",
-  type  = "dens_overlay_grouped"
-)
+### 3.1 How much data do I actually have there?
 
-# Extract, back‑transform and tidy the fixed‑effect draws
-draws_tidy <- fit_onefactor %>%
-  tidy_draws() %>%
-  select(starts_with("b_"), .draw) %>%
-  pivot_longer(
-    cols      = starts_with("b_"),
-    names_to  = "term",
-    values_to = "beta"
-  ) %>%
-  separate(
-    term,            # "b_kappa_conditiongrouped_setSize6:recallPosition…"
-    into  = c(".drop","par","cell"), sep = "_", extra = "merge",
-    remove = TRUE
-  ) %>%
-  mutate(
-    par   = recode(par,
-                   kappa  = "SD° (memory imp.)",
-                   thetat = "P(mem)"),
-    value = if_else(par == "SD° (memory imp.)",
-                    (sqrt(1/exp(beta)) / pi) * 180,    # κ → SD in degrees
-                    plogis(beta))                      # θ → probability
-  )
+# trials per condition  – just one clean table
+collapsedData %>%                           
+  dplyr::count(condition, name = "n_trials")
 
-# Quick forest plot
 
-draws_tidy %>%
-  mutate(cell = str_replace_all(cell, "condition", "")) %>%  # cosmetic
-  group_by(par, cell) %>%
-  mean_qi(value, .width = 0.95) %>%
-  ggplot(aes(x = value, y = reorder(cell, value))) +
-  geom_point() +
-  geom_errorbarh(aes(xmin = .lower, xmax = .upper), height = .1) +
-  facet_wrap(~ par, scales = "free_x") +
-  labs(y = NULL, x = "Posterior mean ± 95 % CrI")
+param_names <- posterior::variables(fit_onefactor)   # character vector
+head(param_names, 20)      # have a look
+
+target <- grep("split_predictable_A", param_names, value = TRUE)
+target
+
+
+rhat(fit_onefactor, pars = target)
+neff_ratio(fit_onefactor, pars = target)
+
+
+### 3.3 Look at the responses themselves
+collapsedData %>%
+  filter(condition == "split_predictable_A") %>%
+  ggplot(aes(x = response_error * 180 / pi)) +   # back to degrees for intuition
+  geom_histogram(bins = 30)
+
+
+# print results summary
+summary(fit_onefactor)
+
+## 4.2) extract parameter estimates --------------------------------------------
+
+# extract the fixed effects from the model
+fixedEff <- fixef(fit_onefactor)
+
+# determine the rows that contain the relevant parameter estimates
+theta_cols <- startsWith(rownames(fixedEff),"thetat_")
+kappa_cols <- startsWith(rownames(fixedEff),"kappa_")
+
+# extract kappa estimates
+kappa_fixedFX <- fixedEff[kappa_cols,]
+
+# convert kappa estimates to absolute scale (radians)
+kappa_fixedFX <- exp(kappa_fixedFX)
+
+# extract theta estimates
+theta_fixedFX <- fixedEff[theta_cols,]
+
+# convert theta estimates into pMem estimates
+p_Mem_fixedFX <- gtools::inv.logit(theta_fixedFX)
+
+# print out parameter estimates
+kappa_fixedFX
+p_Mem_fixedFX
+
+## 4.3) plot parameter estimates -----------------------------------------------
+fx_long <- fit_onefactor %>% 
+  tidy_draws() %>% 
+  select(starts_with("b_"), .chain, .iteration, .draw) %>% 
+  pivot_longer(cols      = starts_with("b_"),
+               names_to  = "modelPar",
+               values_to = "post") %>% 
+  
+  # ── split the name into the parameter (kappa / thetat) and the *full* condition label
+  mutate(par   = str_extract(modelPar, "(?<=b_)[^_]+"),  # picks up "kappa" or "thetat"
+         cond  = str_remove(modelPar, "^b_(kappa|thetat)_")) %>% 
+  
+  # ── put everything into human units
+  mutate(post_human = ifelse(par == "kappa",
+                             sqrt(1/exp(post)) * 180 / pi,  # SD° from log‑κ
+                             plogis(post)))                  # pMem from logit‑θ
+
+
+
+# clean up plots
+clean_plot <- function(...){
+  clean_plot <- theme(panel.grid.major = element_blank(),
+                      panel.grid.minor = element_blank(),
+                      panel.background = element_blank(),
+                      axis.line.x = element_line(color = 'black'),
+                      axis.line.y = element_line(color = 'black'),
+                      legend.key = element_rect(fill = 'white'),
+                      text = element_text(size = 18),
+                      line = element_line(linewidth = 1),
+                      axis.ticks = element_line(linewidth = 1),
+                      ...)
+  return(clean_plot)
+}
+
+
+# plot kappa results
+nice_lbl <- function(x) gsub("_", "\n", x)
+
+kappa_plot <- fx_long %>% 
+  filter(par == "kappa") %>% 
+  ggplot(aes(x = cond, y = post_human)) +
+    geom_half_violin(side = "r",
+                     fill = "grey70", colour = NA,
+                     alpha = .9, scale = "width") +
+    stat_summary(fun.data = mean_hdci,
+                 geom     = "pointrange",
+                 linewidth = .8, size = .7) +
+    labs(x = NULL, y = "Memory imprecision (SD°)") +
+    scale_x_discrete(labels = nice_lbl) +      # ← breaks long labels
+    coord_cartesian(ylim = c(5, 150)) +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 30, hjust = 1))  # ← tilts them
+
+kappa_plot
+
+# plot pMem results
+pMem_plot <- fx_long %>% 
+  filter(par == "thetat") %>% 
+  ggplot(aes(x = cond, y = post_human)) +
+    geom_half_violin(side = "r",
+                     fill = "grey70", colour = NA,
+                     alpha = .9, scale = "width") +
+    stat_summary(fun.data = mean_hdci,
+                 geom     = "pointrange",
+                 linewidth = .8, size = .7) +
+    labs(x = NULL, y = expression(P[memory])) +
+    scale_x_discrete(labels = nice_lbl) +
+    coord_cartesian(ylim = c(.2, 1.05)) +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 30, hjust = 1))
+pMem_plot
+
+# patch plots together
+joint_plot <- (pMem_plot | kappa_plot)
+
+# show joint plot
+joint_plot
 
 ```
-### 5.4.4 Specify and test a priori contrasts
-
+## 5.5 Plotting 
+### 5.5.1 Theta
 ```{r}
-# Build a helper table of the 12 cell names
-cell_names <- draws_tidy %>%
-  distinct(cell) %>% arrange(cell) %>% pull()
-cell_names              # print once to check spelling
 
-# Hypotheses of interest:
-## 4.2.1  Predictable vs Unpredictable  (averaged over A/B & recall positions)
-##        – κ and pMem tested separately
-hyp_predictable <- c(
-  # κ (memory precision)
-  "kappa_conditionsplit_predictable_A:recallPositionTestedFirst
-   = kappa_conditionsplit_unpredictable_A:recallPositionTestedFirst",
+###############################################################################
+# 1)  Design grid – every population‑level combination we want predictions for
+###############################################################################
+design_grid <- collapsedData %>%        # object you created just before fitting
+  distinct(condition, recallPosition) %>% 
+  arrange(condition, recallPosition)
 
-  "kappa_conditionsplit_predictable_A:recallPositionTestedSecond
-   = kappa_conditionsplit_unpredictable_A:recallPositionTestedSecond",
-
-  "kappa_conditionsplit_predictable_B:recallPositionTestedFirst
-   = kappa_conditionsplit_unpredictable_B:recallPositionTestedFirst",
-
-  "kappa_conditionsplit_predictable_B:recallPositionTestedSecond
-   = kappa_conditionsplit_unpredictable_B:recallPositionTestedSecond",
-
-  # θ → pMem
-  "thetat_conditionsplit_predictable_A:recallPositionTestedFirst
-   = thetat_conditionsplit_unpredictable_A:recallPositionTestedFirst",
-
-  "...and so on for the remaining three cells..."
+###############################################################################
+# 2)  Posterior draws for the target component’s mean direction (θ₁) ----------
+###############################################################################
+theta_draws <- brms::posterior_linpred(
+  object     = fit_onefactor,
+  dpar       = "theta1",      # brms’ internal name
+  newdata    = design_grid,
+  re_formula = NA,            # population‑level only
+  transform  = TRUE,          # already on response scale (radians)
+  draws      = 2000
 )
 
-## 4.2.2  “Split” vs “Grouped 6” (benefit) -------------------------------
-## Null: no difference  →  negative estimate means *benefit*
-benefit_pairs <- expand_grid(
-  split = c("split_predictable_A",  "split_predictable_B",
-            "split_unpredictable_A","split_unpredictable_B"),
-  pos   = c("TestedFirst", "TestedSecond")
-) %>%
+theta_long <- theta_draws                                                              %>% 
+  tibble::as_tibble()                                                                  %>% 
+  dplyr::mutate(.draw = dplyr::row_number())                                           %>% 
+  tidyr::pivot_longer(
+    cols      = - .draw,
+    names_to  = ".row",
+    values_to = "thetat_rad"
+  )                                                                                    %>% 
+  dplyr::mutate(.row = base::as.integer(stringr::str_remove(.row, "V")))               %>% 
+  dplyr::left_join(
+    design_grid                                                                       %>% 
+      dplyr::mutate(.row = dplyr::row_number()),
+    by = ".row"
+  )                                                                                    %>% 
+  dplyr::select(-.row)                                                                 %>% 
+  dplyr::mutate(
+    thetat_deg = ((thetat_rad * 180 / base::pi) + 180) %% 360 - 180   # wrap to (‑180,180]
+  )
+
+###############################################################################
+# 3)  Summarise draws (median + 95 % intervals are handy) --------------
+###############################################################################
+theta_summary <- theta_long %>% 
+  group_by(condition, recallPosition) %>% 
+  mean_qi(thetat_deg, .width = .95)  
+
+###############################################################################
+# 4)  Decorate with the same “presentationType / setSize / order” factors -----
+###############################################################################
+theta_summary <- theta_summary %>% 
   mutate(
-    hyp_kappa  = glue::glue(
-      "kappa_condition{split}:recallPosition{pos} =
-       kappa_conditiongrouped_setSize6:recallPosition{pos}"
+    presentationType = case_when(
+      str_detect(condition, "^grouped")             ~ "Grouped",
+      str_detect(condition, "^split_predictable")   ~ "Separate Predictable",
+      str_detect(condition, "^split_unpredictable") ~ "Separate Unpredictable"
     ),
-    hyp_theta  = glue::glue(
-      "thetat_condition{split}:recallPosition{pos} =
-       thetat_conditiongrouped_setSize6:recallPosition{pos}"
-    )
-  ) %>%
-  pivot_longer(c(hyp_kappa, hyp_theta), values_to = "hyp") %>%
-  pull(hyp)
-
-## 4.2.3  Combine all into one vector -----------------------------------
-all_hypotheses <- c(hyp_predictable, benefit_pairs)
-
-# Run hypothesis tests
-hyp_res <- hypothesis(fit_onefactor, all_hypotheses)
-print(hyp_res, digits = 3)
-plot(hyp_res)         # forest plot of posterior contrasts
-
-
-```
-### 5.4.5 Plot contrasts
-```{r}
-diff_draws <- draws_tidy %>%
-  unite(cell_full, cell, par, remove = FALSE) %>%      # unique key
-  select(.draw, cell_full, par, value) %>%
-  pivot_wider(names_from = cell_full, values_from = value)
-
-## Example: Split Predictable A – Split Unpredictable A  (Tested First)
-diff_draws <- diff_draws %>%
-  mutate(
-    d_SD  = `conditionSplit_predictable_A:recallPositionTestedFirst_SD° (memory imp.)` -
-            `conditionSplit_unpredictable_A:recallPositionTestedFirst_SD° (memory imp.)`,
-    d_pMem = `conditionSplit_predictable_A:recallPositionTestedFirst_P(mem)` -
-             `conditionSplit_unpredictable_A:recallPositionTestedFirst_P(mem)`
+    setSize = if_else(str_detect(condition, "setSize3"), "3", "6"),
+    presentationOrder = case_when(
+      str_detect(condition, "_A$") ~ "A",
+      str_detect(condition, "_B$") ~ "B",
+      TRUE                         ~ "none"
+    ),
+    ## tidy factors so they facet / colour exactly like before
+    setSize           = factor(setSize, levels = c("3","6")),
+    presentationType  = factor(
+                          presentationType,
+                          levels = c("Grouped",
+                                     "Separate Predictable",
+                                     "Separate Unpredictable")
+                        ),
+    presentationOrder = factor(presentationOrder, levels = c("none","A","B"))
   )
 
-ggplot(diff_draws, aes(x = d_SD)) +
-  geom_histogram(bins = 80) +
-  geom_vline(xintercept = 0, linetype = 2) +
-  labs(title = "Predictable A – Unpredictable A (Tested First)",
-       x = "Δ SD (deg)", y = "Posterior draws")
+###############################################################################
+# 5)  Plot --------------------------------------------------------------------
+###############################################################################
+plot_theta <- ggplot(
+  theta_summary,
+  aes(
+    x        = recallPosition,
+    y        = thetat_deg,
+    color    = presentationType,
+    linetype = presentationOrder,
+    shape    = presentationOrder,              # keep this mapping
+    group    = interaction(presentationType, presentationOrder)
+  )
+) +
+  geom_point(
+    aes(shape = presentationOrder),
+    position = position_dodge(width = 0.3),
+    size     = 3
+  ) +
+  geom_line(position = position_dodge(width = 0.3)) +
+  geom_errorbar(
+    aes(ymin = .lower, ymax = .upper),
+    width    = 0.2,
+    position = position_dodge(width = 0.3)
+  ) +
+  facet_wrap(~ setSize, nrow = 1) +
+  scale_shape_manual(                         #  ← NEW
+    values = c(
+      "none" = 16,    # filled triangle
+      "A"    = 15,    # filled circle   (was 17 by default)
+      "B"    = 17     # filled square   (unchanged)
+    )
+  ) +
+  scale_linetype_manual(
+    values = c(
+      "none" = "solid",   # was "solid" by default
+      "A"    = "dashed",    # was "dashed" by default
+      "B"    = "dashed"    # leave as‑is (or change to "twodash", "longdash", …)
+    )
+  ) +
+  labs(
+    title    = "Posterior mean direction (θ) by condition",
+    x        = "Recall Position",
+    y        = expression(theta~"(degrees)"),
+    color    = "Presentation Type",
+    shape    = "Presentation Order",
+    linetype = "Presentation Order"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(plot.title = element_text(hjust = 0.5, margin = margin(b = 20)))
+
+print(plot_theta)
+```
+
+### 5.5.2 Kappa
+
+``` {r}
+
+plot_kappa_posterior <- function(
+  fit_object,
+  design_grid,
+  shape_vals  = c("none" = 17, "A" = 16, "B" = 15),
+  ltype_vals  = c("none" = "dashed", "A" = "solid", "B" = "dotted"),
+  draws       = 2000
+) {
+
+  ## ------------------------------------------------------------------
+  ## 0) Posterior draws – κ₁
+  ## ------------------------------------------------------------------
+  kappa_draws <- brms::posterior_linpred(
+    object     = fit_object,
+    dpar       = "kappa1",      # <- location 1 of the mixture
+    newdata    = design_grid,
+    re_formula = NA,
+    transform  = TRUE,
+    draws      = draws
+  )
+
+  ## ------------------------------------------------------------------
+  ## 1) Long format
+  ## ------------------------------------------------------------------
+  kappa_long <- kappa_draws                                           |>
+    tibble::as_tibble()                                              |>
+    dplyr::mutate(.draw = dplyr::row_number())                       |>
+    tidyr::pivot_longer(
+      cols      = - .draw,
+      names_to  = ".row",
+      values_to = "kappa"
+    )                                                                |>
+    dplyr::mutate(.row = base::as.integer(stringr::str_remove(.row, "V"))) |>
+    dplyr::left_join(
+      design_grid                                                    |>
+        dplyr::mutate(.row = dplyr::row_number()),
+      by = ".row"
+    )                                                                |>
+    dplyr::select(-.row)
+
+  ## ------------------------------------------------------------------
+  ## 2) Summaries
+  ## ------------------------------------------------------------------
+  kappa_sum <- kappa_long                                             |>
+    dplyr::group_by(condition, recallPosition)                        |>
+    tidybayes::mean_qi(kappa, .width = .95)
+
+  ## ------------------------------------------------------------------
+  ## 3) Decorate (same rules you used for θ and ρ)
+  ## ------------------------------------------------------------------
+  kappa_sum <- kappa_sum |>
+    dplyr::mutate(
+      presentationType = dplyr::case_when(
+        stringr::str_detect(condition, "^grouped")             ~ "Grouped",
+        stringr::str_detect(condition, "^split_predictable")   ~ "Separate Predictable",
+        stringr::str_detect(condition, "^split_unpredictable") ~ "Separate Unpredictable"
+      ),
+      setSize = dplyr::if_else(stringr::str_detect(condition, "setSize3"), "3", "6"),
+      presentationOrder = dplyr::case_when(
+        stringr::str_detect(condition, "_A$") ~ "A",
+        stringr::str_detect(condition, "_B$") ~ "B",
+        TRUE                                  ~ "none"
+      ),
+      setSize           = factor(setSize,           levels = c("3", "6")),
+      presentationType  = factor(presentationType,  levels = c("Grouped",
+                                                               "Separate Predictable",
+                                                               "Separate Unpredictable")),
+      presentationOrder = factor(presentationOrder, levels = c("none", "A", "B"))
+    )
+
+  ## ------------------------------------------------------------------
+  ## 4) Plot
+  ## ------------------------------------------------------------------
+  ggplot2::ggplot(
+    kappa_sum,
+    ggplot2::aes(
+      x        = recallPosition,
+      y        = kappa,
+      color    = presentationType,
+      shape    = presentationOrder,
+      linetype = presentationOrder,
+      group    = interaction(presentationType, presentationOrder)
+    )
+  ) +
+    ggplot2::geom_point(
+      position = ggplot2::position_dodge(width = 0.3),
+      size     = 3
+    ) +
+    ggplot2::geom_line(position = ggplot2::position_dodge(width = 0.3)) +
+    ggplot2::geom_errorbar(
+      ggplot2::aes(ymin = .lower, ymax = .upper),
+      width    = 0.2,
+      position = ggplot2::position_dodge(width = 0.3)
+    ) +
+    ggplot2::facet_wrap(~ setSize, nrow = 1) +
+    ggplot2::scale_shape_manual(values = shape_vals) +
+    ggplot2::scale_linetype_manual(values = ltype_vals) +
+    ggplot2::labs(
+      title    = "Posterior concentration (κ) by condition",
+      x        = "Recall Position",
+      y        = expression(kappa),
+      color    = "Presentation Type",
+      shape    = "Presentation Order",
+      linetype = "Presentation Order"
+    ) +
+    ggplot2::theme_minimal(base_size = 14) +
+    ggplot2::theme(
+      plot.title = ggplot2::element_text(hjust = .5, margin = ggplot2::margin(b = 20))
+    )
+}
+
+design_grid <- collapsedData |>
+  dplyr::distinct(condition, recallPosition) |>
+  dplyr::arrange(condition, recallPosition)
+
+plot_kappa_posterior(
+  fit_object  = fit_onefactor,
+  design_grid = design_grid,
+  shape_vals  = c("none" = 16, "A" = 17, "B" = 15),
+  ltype_vals  = c("none" = "solid", "A" = "dashed", "B" = "dashed")
+)
+```
+
+## 5.6 Hypotheses testing
+
+```{r}
+## ────────────────────────────────────────────────────────────────
+## Complete hypothesis list for `fit_onefactor`
+## ────────────────────────────────────────────────────────────────
+## ── comparisons centred on the β‑coefficients ─────────────────────────
+hyp_focus <- c(
+  # ── grouped‑6 versus pooled ‘unpredictable’ ──
+  kappa_g6_vs_unpredPool = "
+    kappa_conditiongrouped_setSize6
+  = 0.5 * ( kappa_conditionsplit_unpredictable_A
+          + kappa_conditionsplit_unpredictable_B )",
+
+  kappa_g6_vs_predPool   = "
+    kappa_conditiongrouped_setSize6
+  = 0.5 * ( kappa_conditionsplit_predictable_A
+          + kappa_conditionsplit_predictable_B )",
+
+  theta_g6_vs_unpredPool = "
+    thetat_conditiongrouped_setSize6
+  = 0.5 * ( thetat_conditionsplit_unpredictable_A
+          + thetat_conditionsplit_unpredictable_B )",
+
+  theta_g6_vs_predPool   = "
+    thetat_conditiongrouped_setSize6
+  = 0.5 * ( thetat_conditionsplit_predictable_A
+          + thetat_conditionsplit_predictable_B )",
+
+  # ── grouped‑3 versus the same pools ──────────────────────────────────
+  kappa_g3_vs_unpredPool = "
+    kappa_conditiongrouped_setSize3
+  = 0.5 * ( kappa_conditionsplit_unpredictable_A
+          + kappa_conditionsplit_unpredictable_B )",
+
+  kappa_g3_vs_predPool   = "
+    kappa_conditiongrouped_setSize3
+  = 0.5 * ( kappa_conditionsplit_predictable_A
+          + kappa_conditionsplit_predictable_B )",
+
+  theta_g3_vs_unpredPool = "
+    thetat_conditiongrouped_setSize3
+  = 0.5 * ( thetat_conditionsplit_unpredictable_A
+          + thetat_conditionsplit_unpredictable_B )",
+
+  theta_g3_vs_predPool   = "
+    thetat_conditiongrouped_setSize3
+  = 0.5 * ( thetat_conditionsplit_predictable_A
+          + thetat_conditionsplit_predictable_B )",
+
+  # ── grouped‑6 versus grouped‑3 ───────────────────────────────────────
+  kappa_g6_vs_g3 = "
+    kappa_conditiongrouped_setSize6
+  = kappa_conditiongrouped_setSize3",
+
+  theta_g6_vs_g3 = "
+    thetat_conditiongrouped_setSize6
+  = thetat_conditiongrouped_setSize3"
+)
+
+
+# Full set
+hypothesis(fit_onefactor, hyp_focus)
+
+plot(hypothesis(fit_onefactor, hyp_focus))
+
+
+## ------- BF10 between two cells ------------------------------------------
+bf10_cell <- function(cond1, pos1,         # first cell
+                      cond2, pos2,         # second cell
+                      dpar      = "kappa1",# or "theta1", "kappa2", ...
+                      transform = TRUE     # TRUE → natural scale
+) {
+
+  nd <- data.frame(
+    condition      = c(cond1, cond2),
+    recallPosition = c(pos1,  pos2)
+  )
+
+  ## draws is an iterations × 2 matrix (col‑1 = first cell, col‑2 = second)
+  draws <- posterior_linpred(
+    fit_onefactor,
+    newdata    = nd,
+    re_formula = NA,        # population‑level only
+    dpar       = dpar,      # <- must be one of the names in the error msg
+    transform  = transform
+  )
+
+  diff <- draws[, 1] - draws[, 2]
+  mean(diff > 0) / mean(diff < 0)          # BF10 (odds for a positive diff)
+}
+
+## grouped‑6 vs split_predictable_B ─ Tested‑First
+BF10_kappa_first <- bf10_cell(
+  "grouped_setSize6",  "Tested First",
+  "split_predictable_B","Tested First",
+  dpar = "kappa1"     # precision of the target component
+)
+
+BF10_theta_first <- bf10_cell(
+  "grouped_setSize6",  "Tested First",
+  "split_predictable_B","Tested First",
+  dpar = "theta1"     # log‑odds of the target component
+)
+
+## grouped‑6 vs split_predictable_A ─ Tested‑Second
+BF10_kappa_second <- bf10_cell(
+  "grouped_setSize6",  "Tested Second",
+  "split_predictable_A","Tested Second",
+  dpar = "kappa1"
+)
+
+BF10_theta_second <- bf10_cell(
+  "grouped_setSize6",  "Tested Second",
+  "split_predictable_A","Tested Second",
+  dpar = "theta1"
+)
+
+
 ```
